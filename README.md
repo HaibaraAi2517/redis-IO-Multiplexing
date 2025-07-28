@@ -11,7 +11,6 @@
 
 不过复用实现起来是需要特殊的 socket 事件管理机制的，一共有select，poll，epoll三种机制，最典型和高效的方案就是 epoll。放到餐厅的例子来，epoll 就相当于桌子上的二维码，顾客只需要扫描二维码，就可以通知到服务员。
 
-关于这三种方式的底层实现，以及LUNIX如何处理， 这里不多赘述，可在主页的 **《》** 中查看。
 
 在 epoll 的系列函数里， epoll_create 用于创建一个 epoll 对象，epoll_ctl 用来给 epoll 对象添加或者删除一个 socket。epoll_wait 就是查看它当前管理的这些 socket 上有没有可读可写事件发生。
 
