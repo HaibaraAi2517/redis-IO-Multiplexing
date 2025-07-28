@@ -29,7 +29,8 @@
 在理解了 epoll 原理后，我们从源码中看 Redis 具体是如何使用 epoll 的。直接在 Github 上就可以非常方便地获取 Redis 的源码。
 其中整个 Redis 服务的代码总入口在 src/server.c 文件中，把入口函数的核心部分摘了出来，如下。
 
-```//file: src/server.c
+```c
+//file: src/server.c
 int main(int argc, char **argv) {
     ......
     // 启动初始化
