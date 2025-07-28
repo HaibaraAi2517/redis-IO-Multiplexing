@@ -373,7 +373,7 @@ void aeMain(aeEventLoop *eventLoop) {
     eventLoop->stop = 0;
     while (!eventLoop->stop) {
 
-        // 3.4 若设置了 beforeSleep，则优先执行
+        // 3.4 3.4 beforesleep 处理写任务队列并实际发送（后面会重点讲到）
         if (eventLoop->beforesleep != NULL)
             eventLoop->beforesleep(eventLoop);
 
@@ -384,10 +384,6 @@ void aeMain(aeEventLoop *eventLoop) {
 ```
 
 Redis 在每轮循环中要完成以下 **四件关键任务**：
-
----
-
-当然可以！下面是润色后的版本，逻辑更清晰，表达更专业且细致，适合面试场景展示：
 
 ---
 
@@ -477,7 +473,7 @@ static void acceptCommonHandler(int fd, int flags) {
 }
 ```
 
-`createClient` 是创建客户端连接对象的核心函数。在这里，它通过动态分配内存创建一个 `redisClient`，并且最关键的是，它会为该连接注册一个读事件处理函数 `readQueryFromClient`，这样一旦客户端发送数据，Redis 能够及时读取并处理：
+`createClient` 是创建客户端连接对象的核心函数。在这里，它通过动态分配内存创建一个 `redisClient`，并且最关键的是，**它会为该连接注册一个读事件处理函数 `readQueryFromClient`**，这样一旦客户端发送数据，Redis 能够及时读取并处理：
 
 ```c
 redisClient *createClient(int fd) {
@@ -495,9 +491,6 @@ redisClient *createClient(int fd) {
 
 ---
 
-当然可以，以下是对这段文字的润色版本，逻辑更清晰、术语更准确、表达更有条理，突出 Redis 事件驱动和命令处理机制的核心流程，适合在面试中展示你的理解深度：
-
----
 
 ### 3.3 处理客户端连接上的可读事件
 
@@ -606,7 +599,7 @@ void addReply(client *c, robj *obj) {
 这个函数完成了两个关键任务：
 
 1. **将 client 添加到等待写入任务队列中（`clients_pending_write`）**
-2. **将响应写入输出缓冲区（response buffer）**
+2. **将响应写入输出缓冲区buf（response buffer）**
 
 其中 `prepareClientToWrite` 的作用就是将当前客户端标记为等待写操作，并加入到 `server.clients_pending_write` 队列中：
 
@@ -636,7 +629,7 @@ int _addReplyToBuffer(client *c, const char *s, size_t len) {
 }
 ```
 
-如果缓冲区满了，还可以退回到链表式的缓冲机制 `_addReplyStringToList` 中继续写入，确保大响应也能正确发送。
+如果缓冲区满了，还可以退回到链表式的缓冲机制 `_addReplyStringToList` 中继续写入 reply，确保大响应也能正确发送。
 
 ---
 
@@ -647,7 +640,8 @@ int _addReplyToBuffer(client *c, const char *s, size_t len) {
 * **响应回写机制完善（buffer + pending\_write）**
 
 这样的设计既保证了性能，又具备良好的扩展性
----
+
+ ## 这时，只是将client添加到任务队列中，并没有真正的处理。真正的处理过程在beforesleep这个关键的函数里
 
 
 
@@ -715,12 +709,10 @@ int handleClientsWithPendingWrites(void) {
 ```
 
 这个函数的核心逻辑是：
-
 * 遍历 `server.clients_pending_write` 写任务队列；
 * 调用 `writeToClient` 尝试把缓冲区中的响应数据发送到客户端；
 * 如果一次写不完，就注册 `AE_WRITABLE` 写事件，让 epoll 下次可写时继续发送。
-
----
+* 注册一个写事件处理器sendReplyToClient，等待 epoll_wait 发现可写后再处理 
 
 #### 3.4.3.核心写操作：`writeToClient`
 
@@ -764,7 +756,140 @@ writeToClient 的核心逻辑是通过 write 系统调用，将 Redis 命令的�
 
 因此，Redis 判断 `clientHasPendingReplies` 返回 true 时，就意味着还有数据未发送完，这时 Redis 会使用 `epoll` 注册写事件等待下一轮发送，避免阻塞主线程。
 
+### 这是具体流程：
+
+客户端发送命令
+    ↓
+Redis 处理命令，生成响应
+    ↓
+将响应写入 c->buf / c->reply
+    ↓
+调用 writeToClient 尝试发送
+    ↓
+[是否全部发送成功？]
+ ├─ 是：不注册写事件，任务完成
+ └─ 否：注册 AE_WRITABLE，绑定 sendReplyToClient
+            ↓
+    epoll 检测到 socket 可写
+            ↓
+    sendReplyToClient 被调用 → 继续发送
+
+ ## 对于AE_WRITABLE和sendReplyToClient的关系，可以这样理解：“如果 socket 可写了（AE_WRITABLE），请调用 sendReplyToClient() 来处理它。”
+
+
+## 四、总结 在 Redis 中，尽管服务器端处理是单线程的，但却能轻松支撑每秒数万 QPS 的高并发性能
+
+在 Redis 中，尽管服务器端处理是单线程的，但却能轻松支撑**每秒数万 QPS** 的高并发性能。这背后的关键，就是对 **Linux 提供的 I/O 多路复用机制——`epoll` 的精妙运用**。
+
+其实，Redis 的核心逻辑可以浓缩为两个关键函数：
+
+### 1. `initServer` —— 初始化服务器
+
+### 2. `aeMain` —— 启动事件循环
+
+只要理解了这两个函数，Redis 的运行机制就掌握了大半。
+
 ---
+
+### 入口：main 函数
+
+```c
+// file: src/server.c
+int main(int argc, char **argv) {
+    ...
+    initServer();             // 初始化服务，监听端口等
+    aeMain(server.el);        // 启动事件循环，直到 Redis 关闭
+}
+```
+
+`main` 函数是 Redis 的入口，调用 `initServer` 完成服务初始化，然后进入 `aeMain`，启动事件循环系统。
+
+---
+
+### 服务初始化：`initServer`
+
+在 `initServer` 函数中，Redis 完成了三件非常关键的准备工作：
+
+1. **创建 epoll 实例（通过 `aeCreateEventLoop`）**
+   这是 Redis 对 epoll 多路复用机制的封装，负责后续所有 fd 的事件注册与监听。
+
+2. **监听配置的端口（调用 `listen` 创建 listen socket）**
+   Redis 支持多个端口监听，会创建一个或多个 server socket。
+
+3. **将 listen socket 注册到 epoll 中，监听连接事件**
+   使用 `aeCreateFileEvent`，将 listen fd 与 `AE_READABLE` 事件绑定，当有新连接到来时被 epoll 通知。
+
+---
+
+### 事件主循环：`aeMain`
+
+这是 Redis 最核心的运行机制，采用单线程死循环：
+
+```c
+void aeMain(aeEventLoop *eventLoop) {
+    eventLoop->stop = 0;
+    while (!eventLoop->stop) {
+        if (eventLoop->beforesleep)
+            eventLoop->beforesleep(eventLoop);  // 发送前准备，比如处理写任务队列
+
+        aeProcessEvents(eventLoop, AE_ALL_EVENTS);  // 处理所有事件（读/写/定时等）
+    }
+}
+```
+
+主循环的每一轮都做了这些事情：
+
+#### 1. 使用 `epoll_wait` 等待事件发生
+
+监听所有已注册 fd 的可读、可写等事件，一旦 socket 状态准备就绪（如有数据可读），马上返回处理。
+
+#### 2. 处理监听 socket 上的新连接
+
+当 `listen socket` 有连接到达，会调用连接处理器 `acceptTcpHandler`，接收客户端连接并注册到 epoll。
+
+#### 3. 处理客户端命令
+
+如果某个客户端 socket 上有数据可读，Redis 会读取数据、解析命令并执行，然后把响应结果写入该 client 的输出缓冲区。
+
+#### 4. 加入写任务队列
+
+命令结果暂时不会立刻写回客户端，而是加入写任务队列 `server.clients_pending_write`，待本轮末尾统一处理。
+
+#### 5. `beforeSleep`：写任务最终发送
+
+每轮事件处理前，会调用 `beforeSleep`。它会遍历写任务队列，调用 `writeToClient` 将数据真正通过 `write()` 系统调用写入 socket。
+
+---
+
+### 重点细节：**写不完怎么办？**
+
+因为每个 socket 的内核发送缓冲区是有限的，**一条命令的响应如果太大，可能一次写不完**。这种情况，Redis 的处理非常巧妙：
+
+1. `writeToClient` 如果发现还有数据未发送完（例如大对象或网络阻塞），就不会死等；
+2. 而是调用：
+
+   ```c
+   aeCreateFileEvent(server.el, c->fd, AE_WRITABLE, sendReplyToClient, c);
+   ```
+
+   **注册 `AE_WRITABLE` 写事件，并绑定处理函数 `sendReplyToClient`**；
+3. 下一轮 `epoll_wait` 发现该 socket 可写时，就调用 `sendReplyToClient` 补发剩余数据；
+4. 数据发完后再取消写事件监听，避免 epoll 不断唤醒浪费资源。
+
+---
+
+###  单线程也能高并发的核心逻辑
+
+| 机制              | 描述                                      |
+| --------------- | --------------------------------------- |
+| **epoll + 单线程** | 所有 fd 用 epoll 统一管理，无需多线程上下文切换           |
+| **统一事件循环**      | `aeMain` 实现所有网络、命令处理、延迟任务的调度            |
+| **读写分离处理**      | 命令处理后不立即写出，而是加入队列，在 `beforeSleep` 中统一处理 |
+| **写事件自动注册**     | 如果响应数据太大写不完，自动注册写事件，后续继续发送              |
+
+---
+
+通过这种模型，Redis 实现了**单线程驱动、事件驱动、I/O 非阻塞、网络极致优化**的高性能架构。
 
 
 
