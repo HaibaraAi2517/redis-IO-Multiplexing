@@ -163,11 +163,11 @@ static int aeApiCreate(aeEventLoop *eventLoop) {
 
 ---
 
-### 2.2 Redis 监听服务端口的底层实现流程解析
+## 2.2 Redis 监听服务端口的底层实现流程解析
 
 在 Redis 启动阶段，监听端口的核心逻辑集中在 `listenToPort` 函数中，其主要作用是初始化服务器监听套接字，为后续客户端连接建立基础。
 
-#### 2.2.1. 支持多端口绑定
+### 2.2.1. 支持多端口绑定
 
 ```c
 int listenToPort(int port, int *fds, int *count);
@@ -175,7 +175,7 @@ int listenToPort(int port, int *fds, int *count);
 
 Redis 支持多网卡地址绑定（例如 `127.0.0.1` 和 `0.0.0.0` 同时监听），因此在 `listenToPort` 中通过一个 `for` 循环，遍历所有配置的 `bindaddr`，并多次调用 `anetTcpServer`，为每个地址创建监听套接字。成功创建的 `fd` 会记录在传入的 `fds` 数组中。
 
-#### 2.2.2. 抽象封装 `anetTcpServer`
+### 2.2.2. 抽象封装 `anetTcpServer`
 
 调用链如下：
 
@@ -191,7 +191,7 @@ int anetTcpServer(char *err, int port, char *bindaddr, int backlog) {
 }
 ```
 
-#### 2.2.3. 关键系统调用封装
+### 2.2.3. 关键系统调用封装
 
 在 `_anetTcpServer` 中，完成以下核心系统调用：
 
@@ -219,7 +219,7 @@ int anetTcpServer(char *err, int port, char *bindaddr, int backlog) {
 
 这些操作最终在 `anetListen` 中实现，该函数是对底层系统调用 `bind()` 和 `listen()` 的封装，并处理可能的错误信息。
 
-#### 4. 安全性与健壮性设计
+### 4. 安全性与健壮性设计
 
 整个监听流程中，Redis 通过封装 `anet.c` 模块，提供了统一的错误处理、跨平台支持、参数校验、日志记录等机制，提升了网络模块的健壮性与可维护性。
 
@@ -228,6 +228,550 @@ int anetTcpServer(char *err, int port, char *bindaddr, int backlog) {
 * Redis 通过抽象封装网络模块，将复杂的系统调用封装在 `anet.c`，提高代码可读性和跨平台兼容性。
 * 支持多网卡绑定与端口复用，适用于高可用、容灾部署需求。
 * 所有监听套接字最终会注册到 `aeEventLoop`（事件循环）中，实现基于 `epoll` 的 I/O 多路复用，配合事件驱动模型，高效处理并发连接。
+
+  当然可以，以下是润色后的内容，使其更专业、更具逻辑性和条理性，同时保留原意，突出对系统底层机制的深入理解：
+
+---
+
+### 2.3 注册事件回调函数
+
+我们再次回顾 `initServer` 函数的执行流程。在前2.2中，`initServer` 依次完成了以下关键步骤：
+
+1. 通过 `aeCreateEventLoop` 创建了事件循环对象（底层封装了 epoll 实例），用于后续的 I/O 多路复用管理。
+2. 通过 `listenToPort` 完成了对服务端口的 `bind` 与 `listen` 操作，初始化监听 socket。
+3. 最关键的一步是，调用 `aeCreateFileEvent` 注册了 `accept` 事件的处理回调。
+
+```c
+// file: src/server.c
+void initServer(void) {
+    // 2.1.1 创建 epoll 实例并初始化事件循环
+    server.el = aeCreateEventLoop(server.maxclients + CONFIG_FDSET_INCR);
+
+    // 2.1.2 监听指定服务端口
+    listenToPort(server.port, server.ipfd, &server.ipfd_count);
+
+    // 2.1.3 注册 accept 事件处理器
+    for (j = 0; j < server.ipfd_count; j++) {
+        aeCreateFileEvent(server.el, server.ipfd[j], AE_READABLE,
+                          acceptTcpHandler, NULL);
+    }
+}
+```
+
+可以看到，在调用 `aeCreateFileEvent` 时，传入了一个非常关键的回调函数指针 `acceptTcpHandler`。这个函数将在监听 socket 上有新连接到来时被触发调用，处理连接的 `accept` 操作。下面我们来看 `aeCreateFileEvent` 的实现细节：
+
+```c
+// file: src/ae.c
+int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
+                      aeFileProc *proc, void *clientData)
+{
+    // 获取指定 fd 对应的事件结构体
+    aeFileEvent *fe = &eventLoop->events[fd];
+
+    // 封装底层 epoll_ctl 调用，添加感兴趣的事件
+    aeApiAddEvent(eventLoop, fd, mask);
+
+    // 设置事件的类型和处理函数
+    fe->mask |= mask;
+    if (mask & AE_READABLE) fe->rfileProc = proc;
+    if (mask & AE_WRITABLE) fe->wfileProc = proc;
+
+    // 设置私有数据指针，便于回调中使用
+    fe->clientData = clientData;
+
+    return AE_OK;
+}
+```
+
+此函数的核心逻辑如下：
+
+* 首先从 `eventLoop->events` 数组中获取了 fd 对应的 `aeFileEvent` 实例。在前面我们已介绍，`eventLoop->events` 是 Redis 用于存储所有文件描述符相关事件状态的数组。
+* 接着调用 `aeApiAddEvent` 函数，封装对 `epoll_ctl` 的调用。具体代码如下：
+
+```c
+// file: src/ae_epoll.c
+static int aeApiAddEvent(aeEventLoop *eventLoop, int fd, int mask) {
+    int op = (eventLoop->events[fd].mask == AE_NONE) ?
+             EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+
+    // 构造 epoll_event 并调用 epoll_ctl
+    epoll_ctl(state->epfd, op, fd, &ee);
+
+    return 0;
+}
+```
+
+通过这一操作，Redis 成功将 fd 注册到 epoll 实例中，监听对应的读/写事件。epoll 在后续调用 `epoll_wait` 时就可以检测这些事件。
+
+此后，每一个 `aeFileEvent` 实例上，都可能包含以下三项关键信息：
+
+* `rfileProc`：可读事件触发时的回调函数。
+* `wfileProc`：可写事件触发时的回调函数。
+* `clientData`：用于回调时传入的私有上下文数据。
+
+当某个 fd 上有事件触发时，Redis 会从 `eventLoop->events[fd]` 中读取对应的 `aeFileEvent`，并根据事件类型调用相应的回调处理函数（例如 `rfileProc`）。
+
+回到 `initServer` 中注册监听 fd 的事件逻辑：
+
+```c
+// file: src/server.c
+for (j = 0; j < server.ipfd_count; j++) {
+    aeCreateFileEvent(server.el, server.ipfd[j], AE_READABLE,
+                      acceptTcpHandler, NULL);
+}
+```
+
+这里 Redis 为监听 socket 注册了 `AE_READABLE` 事件，回调函数是 `acceptTcpHandler`，也就是说，当有新的客户端连接请求到达时，epoll 检测到该 fd 可读，随后触发 `acceptTcpHandler` 来执行实际的连接建立操作。
+
+注意：
+
+* 只设置了读事件（AE\_READABLE），未设置写事件（AE\_WRITABLE），因为监听 socket 通常只关注“是否有新连接请求到达”这一事件。
+* `clientData` 被设置为 `NULL`，说明此阶段没有传递额外上下文数据。
+
+通过这一流程，Redis 的事件驱动模型得以运行起来。当后续调用 `aeMain` 启动事件循环后，所有注册的事件处理器将随 epoll 的通知被触发执行，实现高效的非阻塞 I/O 通信机制。
+
+---
+
+1. **epoll 的封装思路**：Redis 将 epoll 封装为独立模块，便于跨平台扩展。
+2. **事件驱动模型解耦性强**：事件注册和事件触发逻辑分离，利于维护。
+3. **注册回调机制简洁高效**：通过设置 `rfileProc` / `wfileProc` 实现不同事件类型的响应。
+
+
+## 三、redis的aeMain循环事件处理
+
+---
+
+###  Redis 启动后正式进入事件循环 —— `aeMain`
+
+在前一节中，我们已经完成了 Redis 启动初始化的核心流程：
+
+* 创建了 epoll 实例（通过 `aeCreateEventLoop`），
+* 绑定并监听了服务端口（`listenToPort`），
+* 并为监听 socket 注册了 `accept` 事件处理器（`acceptTcpHandler`）。
+
+这些准备工作完成后，Redis 会进入主循环函数 `aeMain`，真正开始响应客户端请求。
+
+```c
+// file: src/server.c
+int main(int argc, char **argv) {
+    ...
+    // 初始化服务器（创建 epoll、绑定端口、注册回调）
+    initServer();
+
+    // 启动事件循环，直到服务器关闭
+    aeMain(server.el);
+}
+```
+
+### aeMain：Redis 核心事件驱动循环
+
+`aeMain` 是 Redis 的主事件循环。它本质上是一个无限循环结构，每一轮循环负责处理一次 I/O 多路复用轮询 + 用户逻辑的触发。其执行逻辑概括如下：
+
+```c
+// file: src/ae.c
+void aeMain(aeEventLoop *eventLoop) {
+    eventLoop->stop = 0;
+    while (!eventLoop->stop) {
+
+        // 3.4 若设置了 beforeSleep，则优先执行
+        if (eventLoop->beforesleep != NULL)
+            eventLoop->beforesleep(eventLoop);
+
+        // 3.1-3.3 调用 epoll_wait 等待并处理所有事件
+        aeProcessEvents(eventLoop, AE_ALL_EVENTS);
+    }
+}
+```
+
+Redis 在每轮循环中要完成以下 **四件关键任务**：
+
+---
+
+当然可以！下面是润色后的版本，逻辑更清晰，表达更专业且细致，适合面试场景展示：
+
+---
+
+### 3.1 epoll_wait 事件发现机制
+
+在 Redis 中，无论有多少客户端连接，所有的网络事件（包括连接请求的 accept 事件、数据可读事件以及数据可写事件）都统一通过 `epoll_wait` 进行检测和管理。甚至包括定时器等时间事件，也被整合进 `epoll_wait` 的等待时长中，实现了对所有事件的统一调度与高效处理。
+
+
+当 `epoll_wait` 监测到某个文件描述符（fd）上的事件发生时，Redis 会触发相应的、事先注册好的回调函数来处理这些事件。具体来看，`aeProcessEvents` 函数对 `epoll_wait` 进行了封装，负责事件的等待和分发，代码逻辑如下：
+
+```c
+int aeProcessEvents(aeEventLoop *eventLoop, int flags)
+{
+    // 计算最近一个时间事件的触发时间，作为阻塞等待的超时时间
+    tvp = /* 计算时间事件超时时间 */;
+
+    // 通过底层封装函数调用 epoll_wait，等待事件发生，等待时间由时间事件决定
+    numevents = aeApiPoll(eventLoop, tvp);
+
+    // 遍历所有已就绪的事件
+    for (j = 0; j < numevents; j++) {
+        // 取出对应 fd 的事件结构体
+        aeFileEvent *fe = &eventLoop->events[eventLoop->fired[j].fd];
+
+        // 如果该事件是读事件且有对应的读事件处理函数，则调用它
+        if (fe->mask & AE_READABLE && fe->rfileProc)
+            fe->rfileProc(eventLoop, eventLoop->fired[j].fd, fe->clientData, AE_READABLE);
+
+        // 如果该事件是写事件且有对应的写事件处理函数，则调用它
+        if (fe->mask & AE_WRITABLE && fe->wfileProc)
+            fe->wfileProc(eventLoop, eventLoop->fired[j].fd, fe->clientData, AE_WRITABLE);
+    }
+}
+```
+
+`aeProcessEvents` 核心在于调用 `aeApiPoll`，后者对底层系统调用 `epoll_wait` 进行了封装：
+
+```c
+static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
+    aeApiState *state = eventLoop->apidata;
+
+    // 将 epoll_wait 的超时时间转换为毫秒，若无时间限制则传 -1（阻塞）
+    int timeout = tvp ? (tvp->tv_sec * 1000 + tvp->tv_usec / 1000) : -1;
+
+    // 调用 epoll_wait，等待事件发生
+    int numevents = epoll_wait(state->epfd, state->events, eventLoop->setsize, timeout);
+
+    // 事件的就绪状态会存储在 state->events 中，后续由 aeProcessEvents 处理
+    return numevents;
+}
+```
+
+总结来说，Redis 利用 `epoll_wait` 高效地监听多个文件描述符上的事件，结合事件循环机制统一调度读写事件和时间事件，保证单线程下的高并发性能。这种设计不仅实现了 IO 多路复用，更保证了事件处理的响应及时和资源的合理利用，体现了 Redis 网络模型设计的高效与优雅。
+
+---
+
+
+### 3.2 新连接请求如何处理
+
+假设有一个新的用户连接到达 Redis 服务器。此前我们看到，Redis 在监听 socket 上注册的读事件回调函数是 `acceptTcpHandler`，也就是说，一旦有新的连接请求到来，`acceptTcpHandler` 就会被触发执行。
+
+在 `acceptTcpHandler` 中，Redis 主要完成了三项关键操作：
+
+1. 调用 `accept` 系统调用，接收客户端的连接请求，拿到新的连接 socket；
+2. 为这个新连接创建一个唯一的 `redisClient` 对象，用于管理该客户端的所有状态和数据；
+3. 将新连接添加到事件循环（epoll）中，并注册读事件的处理函数，以便后续读取客户端发来的请求。
+
+接下来，我们详细拆解这三个步骤具体是如何实现的。
+
+首先，在 `acceptTcpHandler` 函数中调用了 `anetTcpAccept`，它内部最终执行的就是 Linux 的 `accept` 系统调用，用于接收新连接并返回新 socket 文件描述符：
+
+```c
+int anetTcpAccept(...) {
+    return anetGenericAccept(...);
+}
+static int anetGenericAccept(...) {
+    return accept(s, (struct sockaddr*)&sa, &salen);
+}
+```
+
+拿到新连接 socket 后，`acceptTcpHandler` 调用 `acceptCommonHandler`，在这里为该 socket 创建一个对应的 `redisClient` 对象：
+
+```c
+static void acceptCommonHandler(int fd, int flags) {
+    redisClient *c = createClient(fd);
+    ...
+}
+```
+
+`createClient` 是创建客户端连接对象的核心函数。在这里，它通过动态分配内存创建一个 `redisClient`，并且最关键的是，它会为该连接注册一个读事件处理函数 `readQueryFromClient`，这样一旦客户端发送数据，Redis 能够及时读取并处理：
+
+```c
+redisClient *createClient(int fd) {
+    redisClient *c = zmalloc(sizeof(redisClient));
+    if (fd != -1) {
+        aeCreateFileEvent(server.el, fd, AE_READABLE, readQueryFromClient, c);
+    }
+    ...
+}
+```
+
+这里的 `aeCreateFileEvent` 会把新连接 socket 的读事件与 `readQueryFromClient` 函数绑定，并把当前 `redisClient` 对象作为私有数据传递，从而完成事件驱动模型下的客户端请求处理准备。
+
+总结来看，Redis 在新连接到达时，通过 `acceptTcpHandler` 接收连接，创建对应客户端对象，并将该连接注册到事件循环中，完成了从连接建立到请求准备的完整链路。这种设计保证了 Redis 能高效且高并发地处理大量客户端连接。
+
+---
+
+当然可以，以下是对这段文字的润色版本，逻辑更清晰、术语更准确、表达更有条理，突出 Redis 事件驱动和命令处理机制的核心流程，适合在面试中展示你的理解深度：
+
+---
+
+### 3.3 处理客户端连接上的可读事件
+
+当已经连接的客户端通过连接发送命令（比如 `GET XXXXX_KEY`）时，Redis 的事件循环会检测到该连接的 socket 上出现了可读事件。此时，之前为该连接注册的读事件处理器 `readQueryFromClient` 会被触发执行。
+
+在 `readQueryFromClient` 中，Redis 完成了以下几步关键操作：
+
+1. **解析命令内容**
+2. **查找并执行命令**
+3. **将响应结果写入输出缓冲区**
+4. **将当前 client 添加到待写队列，等待数据返回**
+
+我们来看具体实现流程：
+
+---
+
+#### 3.3.1. 触发读事件，读取并处理命令
+
+```c
+void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, ...) {
+    redisClient *c = (redisClient*) privdata;
+    processInputBufferAndReplicate(c);
+}
+```
+
+这个函数会进一步调用 `processInputBuffer` 来解析并处理客户端命令：
+
+```c
+void processInputBuffer(redisClient *c) {
+    processCommand(c);  // 执行命令
+}
+```
+
+---
+
+####  3.3.2. 查找命令并执行
+
+`processCommand` 是命令处理的核心函数，它首先根据客户端输入查找命令定义，并检查合法性：
+
+```c
+int processCommand(redisClient *c) {
+    c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
+
+    // 事务模式下入队，否则直接调用处理函数
+    if (c->flags & CLIENT_MULTI && ...) {
+        queueMultiCommand(c);
+    } else {
+        call(c, CMD_CALL_FULL);  // 直接处理命令
+    }
+    return C_OK;
+}
+```
+
+---
+
+#### 3.3.3. 调用具体命令处理函数
+
+在 `call` 函数中，Redis 会调用命令所对应的处理函数，例如 `GET` 命令会对应 `getCommand`：
+
+```c
+void call(client *c, int flags) {
+    c->cmd->proc(c);  // 调用命令对应函数，如 getCommand
+}
+```
+
+```c
+void getCommand(client *c) {
+    getGenericCommand(c);
+}
+```
+
+---
+
+#### 3.3.4. 执行 getGenericCommand 查找数据并写入缓冲区
+
+`getGenericCommand` 是实际处理逻辑，它会尝试从内存中查找 key，并将结果写入输出缓冲区：
+
+```c
+int getGenericCommand(client *c) {
+    robj *o;
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp])) == NULL)
+        return C_OK;
+
+    addReplyBulk(c, o);  // 将响应数据写入缓冲区
+    return C_OK;
+}
+```
+
+---
+
+#### 3.3.5. 将响应数据写入输出缓冲区
+
+`addReplyBulk` 会调用 `addReply` 来完成核心的缓冲区写入逻辑：
+
+```c
+void addReply(client *c, robj *obj) {
+    if (prepareClientToWrite(c) != C_OK) return;
+
+    if (sdsEncodedObject(obj)) {
+        if (_addReplyToBuffer(c, obj->ptr, sdslen(obj->ptr)) != C_OK)
+            _addReplyStringToList(c, obj->ptr, sdslen(obj->ptr));
+    }
+}
+```
+
+这个函数完成了两个关键任务：
+
+1. **将 client 添加到等待写入任务队列中（`clients_pending_write`）**
+2. **将响应写入输出缓冲区（response buffer）**
+
+其中 `prepareClientToWrite` 的作用就是将当前客户端标记为等待写操作，并加入到 `server.clients_pending_write` 队列中：
+
+```c
+int prepareClientToWrite(client *c) {
+    if (!clientHasPendingReplies(c) && !(c->flags & CLIENT_PENDING_READ))
+        clientInstallWriteHandler(c);
+}
+
+void clientInstallWriteHandler(client *c) {
+    c->flags |= CLIENT_PENDING_WRITE;
+    listAddNodeHead(server.clients_pending_write, c);
+}
+```
+
+---
+
+#### 3.3.6. 写入固定大小的 response buffer
+
+实际的响应内容写入是通过 `_addReplyToBuffer` 完成的：
+
+```c
+int _addReplyToBuffer(client *c, const char *s, size_t len) {
+    memcpy(c->buf + c->bufpos, s, len);  // 拷贝到输出缓冲区
+    c->bufpos += len;
+    return C_OK;
+}
+```
+
+如果缓冲区满了，还可以退回到链表式的缓冲机制 `_addReplyStringToList` 中继续写入，确保大响应也能正确发送。
+
+---
+
+### 整个流程从客户端发送命令开始，到命令处理、生成响应并写入缓冲区，再加入写队列等待返回，展现了 Redis 高效的事件驱动架构：
+
+* **事件触发精准（epoll）**
+* **命令处理高效（函数指针 + 命令表）**
+* **响应回写机制完善（buffer + pending\_write）**
+
+这样的设计既保证了性能，又具备良好的扩展性
+---
+
+
+
+### 3.4 beforesleep 关键操作：处理写任务队列
+
+在 Redis 的主事件循环 `aeMain` 中，每次调用 `aeProcessEvents` 处理事件之前，都会先执行一个函数：`beforesleep`。
+虽然名字看起来像是“睡觉前的准备”，但它所承担的责任却十分关键，尤其是**处理客户端写任务队列并将数据真正写回客户端**。
+
+#### 3.4.1.`aeMain` 主循环中的 `beforesleep`
+
+```c
+// file: src/ae.c
+void aeMain(aeEventLoop *eventLoop) {
+    eventLoop->stop = 0;
+    while (!eventLoop->stop) {
+        // beforesleep: 处理写任务队列并实际发送
+        if (eventLoop->beforesleep != NULL)
+            eventLoop->beforesleep(eventLoop);
+
+        aeProcessEvents(eventLoop, AE_ALL_EVENTS);
+    }
+}
+```
+
+每次进入 `aeProcessEvents` 之前都会调用 `beforesleep`，而它在实际中负责处理很多关键性操作，其中一个重要任务就是**将响应数据写回客户端**。
+
+---
+
+#### 3.4.2.`beforeSleep` 的核心：`handleClientsWithPendingWrites`
+
+```c
+// file: src/server.c
+void beforeSleep(struct aeEventLoop *eventLoop) {
+    ...
+    handleClientsWithPendingWrites();
+}
+```
+
+接下来我们看看 `handleClientsWithPendingWrites` 的实现：
+
+```c
+// file: src/networking.c
+int handleClientsWithPendingWrites(void) {
+    listIter li;
+    listNode *ln;
+    int processed = listLength(server.clients_pending_write);
+
+    listRewind(server.clients_pending_write, &li);
+    while ((ln = listNext(&li))) {
+        client *c = listNodeValue(ln);
+        c->flags &= ~CLIENT_PENDING_WRITE;
+        listDelNode(server.clients_pending_write, ln);
+
+        // 实际将响应数据发送到客户端
+        writeToClient(c->fd, c, 0);
+
+        // 如果没发送完，注册写事件等待 epoll 回调
+        if (clientHasPendingReplies(c)) {
+            aeCreateFileEvent(server.el, c->fd, AE_WRITABLE,
+                              sendReplyToClient, c);
+        }
+        ...
+    }
+}
+```
+
+这个函数的核心逻辑是：
+
+* 遍历 `server.clients_pending_write` 写任务队列；
+* 调用 `writeToClient` 尝试把缓冲区中的响应数据发送到客户端；
+* 如果一次写不完，就注册 `AE_WRITABLE` 写事件，让 epoll 下次可写时继续发送。
+
+---
+
+#### 3.4.3.核心写操作：`writeToClient`
+
+```c
+// file: src/networking.c
+int writeToClient(int fd, client *c, int handler_installed) {
+    while (clientHasPendingReplies(c)) {
+        // 发送固定缓冲区
+        if (c->bufpos > 0) {
+            nwritten = write(fd, c->buf + c->sentlen, c->bufpos - c->sentlen);
+            if (nwritten <= 0) break;
+            ...
+        }
+        // 发送链表缓冲中的剩余数据
+        else {
+            o = listNodeValue(listFirst(c->reply));
+            nwritten = write(fd, o->buf + c->sentlen, objlen - c->sentlen);
+            ...
+        }
+    }
+}
+```
+
+在 `writeToClient` 中，Redis 会根据当前的响应缓冲状态：
+
+* 先尝试写出固定缓冲区 `c->buf` 的数据；
+* 如果固定缓冲写完，就进入动态链表 `c->reply` 中，逐条写出数据对象。
+
+writeToClient 的核心逻辑是通过 write 系统调用，将 Redis 命令的处理结果写入客户端对应的 socket，由内核负责将数据实际发送出去。
+由于每条命令的响应数据大小不确定，Redis 采用了**固定大小的缓冲区（c->buf）与可变长度的回复链表（c->reply）**相结合的方式来存储待发送数据。
+发送时，Redis 会优先发送固定缓冲区中的内容，当该缓冲区发送完毕后，再继续发送链表中的回复对象。这样设计既兼顾了小响应的发送效率，也支持了大数据量的分段输出，从而实现了高性能的响应机制
+
+---
+
+### 为什么写操作可能写不完？
+
+一次 `write()` 调用并不保证数据全部写出，原因如下：
+
+* 操作系统对每个 socket 的发送缓冲区有限制；
+* 如果发送内容太大、或者客户端读取太慢，就会导致**写入阻塞或中断**。
+
+因此，Redis 判断 `clientHasPendingReplies` 返回 true 时，就意味着还有数据未发送完，这时 Redis 会使用 `epoll` 注册写事件等待下一轮发送，避免阻塞主线程。
+
+---
+
+
+
+
+
+
+
   
 
 
