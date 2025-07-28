@@ -61,7 +61,7 @@ void initServer() {
     ...
 }
 ```
-**2.1 创建 epoll 对象：事件循环的初始化过程**
+## 2.1 创建 epoll 对象：事件循环的初始化过程
 
 Redis 在启动过程中，会初始化事件驱动模块，构建一个完整的事件循环（event loop）结构。在这过程中，它内部封装了 epoll，并将其用于高效的 I/O 多路复用处理。
 
@@ -158,4 +158,76 @@ static int aeApiCreate(aeEventLoop *eventLoop) {
 * `aeCreateEventLoop()` 是 Redis 构建事件驱动框架的起点。
 * 它封装了 epoll 的底层调用，构建了 `aeEventLoop` 对象，后续所有事件注册、触发与分发均基于该结构进行。
 * epoll 的 `epfd` 会被保存在 `eventLoop->apidata` 中，供后续 `epoll_ctl` 和 `epoll_wait` 调用使用。
+
+  当然可以，下面是对你提供的这段 Redis 监听服务端口过程的专业化、系统化描述，适合用于简历项目经验或面试答辩中，让面试官感受到你对底层细节的理解：
+
+---
+
+### 2.2 Redis 监听服务端口的底层实现流程解析
+
+在 Redis 启动阶段，监听端口的核心逻辑集中在 `listenToPort` 函数中，其主要作用是初始化服务器监听套接字，为后续客户端连接建立基础。
+
+#### 2.2.1. 支持多端口绑定
+
+```c
+int listenToPort(int port, int *fds, int *count);
+```
+
+Redis 支持多网卡地址绑定（例如 `127.0.0.1` 和 `0.0.0.0` 同时监听），因此在 `listenToPort` 中通过一个 `for` 循环，遍历所有配置的 `bindaddr`，并多次调用 `anetTcpServer`，为每个地址创建监听套接字。成功创建的 `fd` 会记录在传入的 `fds` 数组中。
+
+#### 2.2.2. 抽象封装 `anetTcpServer`
+
+调用链如下：
+
+```
+listenToPort -> anetTcpServer -> _anetTcpServer -> anetListen
+```
+
+其中，`anetTcpServer` 是对网络操作的封装，内部实际调用 `_anetTcpServer` 来完成 TCP 套接字创建和监听。
+
+```c
+int anetTcpServer(char *err, int port, char *bindaddr, int backlog) {
+    return _anetTcpServer(err, port, bindaddr, AF_INET, backlog);
+}
+```
+
+#### 2.2.3. 关键系统调用封装
+
+在 `_anetTcpServer` 中，完成以下核心系统调用：
+
+* **创建套接字**（socket）
+  `socket(AF_INET, SOCK_STREAM, 0)`：创建一个 TCP 套接字。
+
+* **设置端口复用选项**
+  `setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, ...)`：避免端口被 TIME\_WAIT 占用导致服务重启失败。
+
+* **绑定地址**
+
+  ```c
+  bind(s, sa, len);
+  ```
+
+  将套接字绑定到指定 IP 和端口。`sa` 为 `sockaddr_in` 类型地址结构体。
+
+* **监听连接**
+
+  ```c
+  listen(s, backlog);
+  ```
+
+  设置监听套接字的连接请求队列长度，开启监听状态。
+
+这些操作最终在 `anetListen` 中实现，该函数是对底层系统调用 `bind()` 和 `listen()` 的封装，并处理可能的错误信息。
+
+#### 4. 安全性与健壮性设计
+
+整个监听流程中，Redis 通过封装 `anet.c` 模块，提供了统一的错误处理、跨平台支持、参数校验、日志记录等机制，提升了网络模块的健壮性与可维护性。
+
+---
+
+* Redis 通过抽象封装网络模块，将复杂的系统调用封装在 `anet.c`，提高代码可读性和跨平台兼容性。
+* 支持多网卡绑定与端口复用，适用于高可用、容灾部署需求。
+* 所有监听套接字最终会注册到 `aeEventLoop`（事件循环）中，实现基于 `epoll` 的 I/O 多路复用，配合事件驱动模型，高效处理并发连接。
+  
+
 
