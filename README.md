@@ -37,4 +37,126 @@ int main(int argc, char **argv) {
     initServer();
     // 运行事件处理循环，一直到服务器关闭为止
     aeMain(server.el);
-}```
+}
+```
+Redis 做了这么三件重要的事情。
+1.创建一个 epoll 对象
+2.对配置的监听端口进行 listen
+3.把 listen socket 让 epoll 给管理起来
+
+```c
+//file: src/server.c
+void initServer() {
+    // 2.1.1 创建 epoll
+    server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
+
+    // 2.1.2 绑定监听服务端口
+    listenToPort(server.port,server.ipfd,&server.ipfd_count);
+
+    // 2.1.3 注册 accept 事件处理器
+    for (j = 0; j < server.ipfd_count; j++) {
+        aeCreateFileEvent(server.el, server.ipfd[j], AE_READABLE,
+            acceptTcpHandler,NULL);
+    }
+    ...
+}
+```
+**2.1 创建 epoll 对象：事件循环的初始化过程**
+
+Redis 在启动过程中，会初始化事件驱动模块，构建一个完整的事件循环（event loop）结构。在这过程中，它内部封装了 epoll，并将其用于高效的 I/O 多路复用处理。
+
+Redis 的事件循环初始化逻辑位于 `aeCreateEventLoop()` 函数中，调用路径为：
+
+```
+server.c → initServer() → aeCreateEventLoop()
+```
+###  创建 epoll 对象的核心数据结构
+
+首先来看 `redisServer` 中保存 epoll 实例的成员变量：
+
+```c
+// file: src/server.c
+struct redisServer {
+    ...
+    aeEventLoop *el;  // 指向事件循环结构的指针
+    ...
+};
+```
+
+Redis 使用 `aeEventLoop` 结构体封装了对 epoll 的调用细节，所有事件驱动相关的逻辑（事件注册、处理、分发）都围绕它展开。
+
+---
+
+### 事件循环的初始化逻辑
+
+以下是 `aeCreateEventLoop()` 函数的核心实现，它位于 `src/ae.c` 中：
+
+```c
+// file: src/ae.c
+aeEventLoop *aeCreateEventLoop(int setsize) {
+    aeEventLoop *eventLoop;
+
+    // 分配事件循环结构体
+    eventLoop = zmalloc(sizeof(*eventLoop));
+
+    // 分配 I/O 事件数组，用于保存注册的事件（可读/可写）
+    eventLoop->events = zmalloc(sizeof(aeFileEvent) * setsize);
+
+    // 初始化 epoll（底层 I/O 多路复用机制）
+    aeApiCreate(eventLoop);
+
+    return eventLoop;
+}
+```
+
+>  **说明：**
+>
+> * `setsize` 表示最多监听多少个文件描述符（FD）
+> * `events` 是一个数组，存储每个 FD 上注册的事件（如 EPOLLIN / EPOLLOUT）
+> * `aeApiCreate()` 是一个平台相关的初始化函数，底层对 epoll 进行封装
+
+---
+
+###  aeEventLoop 结构体概览
+
+```c
+// file: src/ae.h
+typedef struct aeEventLoop {
+    ...
+    aeFileEvent *events;   // 注册的事件数组
+    void *apidata;         // 指向 epoll 封装的私有数据（如 epoll fd）
+    ...
+} aeEventLoop;
+```
+
+---
+
+ epoll 实例的创建（aeApiCreate）
+
+Redis 针对不同平台提供了不同的实现，例如 epoll、kqueue、select。epoll 的实现位于 `ae_epoll.c` 中：
+
+```c
+// file: src/ae_epoll.c
+static int aeApiCreate(aeEventLoop *eventLoop) {
+    aeApiState *state;
+
+    // 分配内部 epoll 封装状态结构
+    state = zmalloc(sizeof(aeApiState));
+
+    // 创建 epoll 文件描述符（大小 1024 已被内核忽略）
+    state->epfd = epoll_create(1024);
+
+    // 将 epoll 状态保存在事件循环结构中
+    eventLoop->apidata = state;
+
+    return 0;
+}
+```
+>
+> * `epoll_create(1024)` 创建了一个 epoll 实例，返回一个 epoll 文件描述符（epfd），用于后续调用 `epoll_ctl`、`epoll_wait`。
+> * `aeApiState` 是对 epoll 的轻量封装，包含 `epfd` 和事件数组等字段。
+
+* `aeCreateEventLoop()` 是 Redis 构建事件驱动框架的起点。
+* 它封装了 epoll 的底层调用，构建了 `aeEventLoop` 对象，后续所有事件注册、触发与分发均基于该结构进行。
+* epoll 的 `epfd` 会被保存在 `eventLoop->apidata` 中，供后续 `epoll_ctl` 和 `epoll_wait` 调用使用。
+
